@@ -1,0 +1,51 @@
+【1】PX/ステージ起動層（OS/OSH）
+  - プロセス: PXEngine/bin/osh
+  - 役割   : DataStage Connector ランタイム（CCフレームワーク）が Java 実行体を起動し、ジョブ設定を受け渡す
+
+【2】DataStage コネクタ層（JDBC 呼び出し側）
+  - 代表パッケージ: com.ibm.is.cc.javastage.*（Connector 共通フレームワーク）
+  - 主処理:
+      DriverManager.getConnection(...)
+      Connection.prepareStatement(...)
+      PreparedStatement.executeQuery()
+    → JDBC ResultSet を読み、DataStage 内部の行バッファへ型変換して詰める
+  - 出力: PX の出力リンクへ行データをプッシュ
+
+【3】Snowflake JDBC ドライバ層（発行～結果取得の中核）
+  - 接続/発行:
+      net.snowflake.client.jdbc.SnowflakeConnectionV1
+      net.snowflake.client.jdbc.SnowflakeStatementV1#executeQuery()
+  - 結果セット（Consumer 側）:
+      net.snowflake.client.jdbc.SnowflakeResultSetV1#next()
+  - 非同期フェッチ/パース（Producer 側）:
+      net.snowflake.client.jdbc.SnowflakeChunkDownloader
+      SnowflakeChunkDownloader$2.downloadAndParseChunk(...)
+  - チャンク表現（2系統）:
+      [JSON 結果パス]
+        net.snowflake.client.jdbc.ResultJsonParserV2.continueParsingInternal(...)
+        net.snowflake.client.jdbc.JsonResultChunk
+        net.snowflake.client.jdbc.JsonResultChunkDataV2.allocateArrays(...)  ← OOM 起点になりやすい
+        ...addOffset(...) / setNull(...) / setValue(...)
+      [Arrow 結果パス]
+        net.snowflake.client.core.arrow.ArrowResultChunk
+  - 通信（REST）:
+      net.snowflake.client.core.SFSession / HttpUtil / RestRequest
+
+【4】デシリアライズ／列ベクトル化（ドライバ内）
+  - JSON: allocateArrays() で行数×列の配列群・nullビット・offset配列を一括確保 → 行ごとに値を詰める
+  - Arrow: Arrow ベクタから JDBC 型へブリッジ（中間オーバーヘッドが小さめ）
+
+【5】Producer–Consumer の連携（ドライバ内）
+  - Producer: result-chunk-downloader-* スレッドが「取得→パース→内部キュー投入」
+  - Consumer: SnowflakeResultSetV1#next() が内部キューから取り出して列値を返す
+
+【6】DataStage 変換・型マッピング層（JDBC → PX 行）
+  - ResultSet.getXxx() で値を取得 → DataStage 列型にマッピング（NUMERIC/DATE/TIMESTAMP/VARCHAR/NVARCHAR/VARIANT 等）
+  - PX の出力リンク（バイナリ行フォーマット）に詰める
+
+【7】PX 出力／下流ステージ
+  - 内部バッファ → 出力リンクへブロック出力 → 下流（Lookup/Transformer/Sequential File 等）へ連結
+
+【8】コミット・クローズ
+  - 正常終了: ResultSet.close() → Statement.close() → Connection.close()
+  - 例外時   : 例外を DataStage ランタイムへ伝搬（ジョブログに反映）
